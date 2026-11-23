@@ -735,6 +735,7 @@ class SamplerJAX:
         flow: Any | None = None,
         loglike_approx_single_fn: Callable[[Array], Any] | None = None,
         local_gnh_fn: Callable[[Array], Array] | None = None,
+        nfm_optimizer_factory: Callable | None = None,
     ):
         """
         Initializes the sampler wrapper.
@@ -757,6 +758,9 @@ class SamplerJAX:
         flow:
             optional flow object.
             If None, IdentityFlowJAX is used.
+        nfm_optimizer_factory:
+            Pass an Optax optimizer factory together with an initialized NFMFlow
+            to fit that map on the retained weighted particles during this run.
         loglike_approx_single_fn:
             optional approximate likelihood function.
             Required when cfg.delayed_acceptance is True.
@@ -792,6 +796,7 @@ class SamplerJAX:
             loglike_approx_single_fn=loglike_approx_single_fn,
             cfg=cfg,
             flow=self.flow,
+            nfm_optimizer_factory=nfm_optimizer_factory,
             local_gnh_fn=local_gnh_fn,
         )
 
@@ -979,6 +984,28 @@ def _build_step_from_particles(
     )
 
 
+def transform_nfm_history(flow, particles, sampling_mode, history_steps, history_width):
+    """Encode retained u rows for geometry without evaluating unused history slots."""
+    def encode(rows):
+        return flow.transform_and_log_det(rows, None)[0]
+
+    if sampling_mode != "persistent":
+        return encode(particles)
+
+    # Persistent reweighting flattens (capacity, history_width, dimension)
+    # and fills future slots with zero. Preserve their transformed value too.
+    width = history_width
+    padded_theta = encode(jnp.zeros_like(particles[:1]))
+    output = jnp.broadcast_to(padded_theta, particles.shape)
+
+    def encode_step(step, result):
+        start = step * width
+        rows = lax.dynamic_slice_in_dim(particles, start, width)
+        return lax.dynamic_update_slice_in_dim(result, encode(rows), start, axis=0)
+
+    return lax.fori_loop(0, history_steps, encode_step, output)
+
+
 def make_run_fn(
     *,
     prior: Prior,
@@ -987,6 +1014,7 @@ def make_run_fn(
     cfg: SamplerConfigJAX,
     flow: Any | None = None,
     local_gnh_fn: Callable[[Array], Array] | None = None,
+    nfm_optimizer_factory: Callable | None = None,
 ) -> _RunFunction:
     """
     Builds the sampler run function.
@@ -1030,6 +1058,16 @@ def make_run_fn(
 
     # static kernel/config values captured by the jitted run function
     kernel = str(cfg.kernel).lower()
+    # Supply an initialized NFMFlow and an explicit Optax optimizer factory
+    # to enable same-run training. Other flows remain fixed as before.
+    train_nfm = nfm_optimizer_factory is not None
+    if train_nfm:
+        from ..normalizing_flow.nfm import NFMFitState, NFMFlow, refresh_nfm
+
+        if not isinstance(flow_obj, NFMFlow) or flow_obj.config.n_dim != cfg.n_dim:
+            raise ValueError("adaptive fitting requires an NFMFlow with cfg.n_dim coordinates")
+        interval = flow_obj.config.training_interval(cfg.n_effective, cfg.n_active)
+
     use_pcn_bool = bool(cfg.preconditioned)
 
     # empirical LI-pCN options
@@ -1195,7 +1233,7 @@ def make_run_fn(
         bisect_steps: int,
         trim_ess: float,
         blob_dim: int,
-    ) -> RunOutputJAX:
+    ) -> tuple[RunOutputJAX, Array | None]:
         """
         Runs the full jitted sampler.
 
@@ -1243,7 +1281,7 @@ def make_run_fn(
         Returns:
         --------
         RunOutputJAX:
-            final particle history and evidence estimate.
+            Final particle history and evidence, plus the optional NFM fit status.
         """
         # convert key and choose dtype
         key = jnp.asarray(key)
@@ -1256,7 +1294,7 @@ def make_run_fn(
         # (ii) fit scaler on the prior samples
         scaler_cfg = fit_jax(prior_samples, scaler_cfg0, scaler_masks)
 
-        def _local_gnh_autodiff(theta_i: Array) -> Array:
+        def _local_gnh_autodiff(theta_i: Array, stage_flow) -> Array:
             """
             Autodiff local GNH approximation in theta-space.
 
@@ -1268,7 +1306,7 @@ def make_run_fn(
             d = theta_i.shape[0]
 
             def potential(th: Array) -> Array:
-                u_i, _ld_flow = flow_obj.bijection.inverse_and_log_det(th, None)
+                u_i, _ld_flow = stage_flow.bijection.inverse_and_log_det(th, None)
                 x_i, _ld_scaler = inverse_jax(
                     u_i[None, :],
                     scaler_cfg,
@@ -1500,7 +1538,7 @@ def make_run_fn(
                 True means another outer SMC step should run.
             """
             # unpack values needed by the stop rule
-            _key_c, state_c, cur_c, _geom_c, _n_eff_c2, it = carry
+            _key_c, state_c, cur_c, _geom_c, _n_eff_c2, it, fit = carry
 
             # continue while sampler has not met stop rule
             not_done = not_termination_jax(
@@ -1511,7 +1549,8 @@ def make_run_fn(
                 n_active=n_active_i32,
             )
             within_cap = it < jnp.asarray(n_max_steps, dtype=it.dtype)
-            return not_done & within_cap
+            active = not_done & within_cap
+            return active & fit.fit_ok if train_nfm else active
 
         def body_fn(carry):
             """
@@ -1534,7 +1573,7 @@ def make_run_fn(
                 updated loop carry for the next SMC iteration.
             """
             # unpack current loop state
-            key_c, state_c, cur_c, geom_c, n_eff_c2, it = carry
+            key_c, state_c, cur_c, geom_c, n_eff_c2, it, fit = carry
 
             # reweight persistent history according to the selected sampling mode
             cur_rw, n_eff_new, stats = reweight_fn(
@@ -1550,172 +1589,176 @@ def make_run_fn(
                 trim_ess=trim_ess,
             )
 
-            def _u2t_keep(ui: Array) -> tuple[Array, Array]:
-                """
-                Maps one kept particle from u-space to theta-space.
+            if train_nfm:
+                key_c, fit_key = jax.random.split(key_c)
+                fit = refresh_nfm(
+                    fit, cur_rw["u"], cur_rw["weights"], fit_key,
+                    iteration=state_c.t + 1, beta=cur_rw["beta"],
+                    interval=interval, optimizer_factory=nfm_optimizer_factory,
+                )
+            stage_flow = fit.flow if train_nfm else flow_obj
 
-                The transformed particles are used to update
-                the fitted geometry before mutation.
-
-                Parameters:
-                -----------
-                ui:
-                    one kept particle in u-space, shape (D,).
-
-                Returns:
-                --------
-                Tuple[Array, Array]:
-                    transformed particle and flow log determinant.
-                """
-                # apply flow bijection to one kept particle
-                th, ld = flow_obj.bijection.transform_and_log_det(ui, None)
-                return th, ld
-
-            # update geometry using kept weighted particles
-            theta_keep, _ = jax.vmap(_u2t_keep, in_axes=0, out_axes=(0, 0))(cur_rw["u"])
-            geom_new, key_c, _ = geometry_fit_jax(
-                geom_c,
-                theta_keep,
-                cur_rw["weights"],
-                use_weights=jnp.asarray(True),
-                key=key_c,
-            )
-
-            if kernel == "dili_pcn":
-                # Use only a small fixed number of high-weight particles for
-                # Hessian/GNH construction. Full Hessians for all kept particles
-                # are usually too expensive.
-                top_w, top_idx = jax.lax.top_k(
+            def finish_stage(key_c):
+                transform = stage_flow.bijection.transform_and_log_det
+                if train_nfm:
+                    theta_keep = transform_nfm_history(
+                        stage_flow, cur_rw["u"], sampling_mode, state_c.t, state_c.u.shape[1]
+                    )
+                else:
+                    theta_keep, _ = jax.vmap(lambda row: transform(row, None))(cur_rw["u"])
+                geom_new, key_c, _ = geometry_fit_jax(
+                    geom_c,
+                    theta_keep,
                     cur_rw["weights"],
-                    k=dili_n_lis_particles,
+                    use_weights=jnp.asarray(True),
+                    key=key_c,
                 )
 
-                theta_gnh = jnp.take(theta_keep, top_idx, axis=0)
-                w_gnh = top_w / jnp.where(
-                    jnp.sum(top_w) > 0,
-                    jnp.sum(top_w),
-                    jnp.asarray(1.0, dtype=top_w.dtype),
+                if kernel == "dili_pcn":
+                    # Use only a small fixed number of high-weight particles for
+                    # Hessian/GNH construction. Full Hessians for all kept particles
+                    # are usually too expensive.
+                    top_w, top_idx = jax.lax.top_k(
+                        cur_rw["weights"],
+                        k=dili_n_lis_particles,
+                    )
+
+                    theta_gnh = jnp.take(theta_keep, top_idx, axis=0)
+                    w_gnh = top_w / jnp.where(
+                        jnp.sum(top_w) > 0,
+                        jnp.sum(top_w),
+                        jnp.asarray(1.0, dtype=top_w.dtype),
+                    )
+
+                    dili_geom = build_dili_pcn_geometry_jax(
+                        theta_gnh,
+                        w_gnh,
+                        local_gnh_fn=local_gnh_effective_fn,
+                        local_gnh_args=(stage_flow,) if cfg.dili_autodiff_gnh else (),
+                        rank=dili_rank,
+                        gnh_floor=dili_gnh_floor,
+                        cov_floor=dili_cov_floor,
+                        complement_var=dili_complement_var,
+                    )
+
+                    dili_center = dili_geom.center
+                    dili_basis = dili_geom.basis
+                    dili_post_var = dili_geom.post_var
+                    dili_cov_ref = dili_geom.cov_ref
+                else:
+                    # Static fallback. These values are not used unless kernel="dili_pcn",
+                    # but keeping fixed shapes makes the mutate call simple.
+                    d = theta_keep.shape[1]
+                    dtype_theta = theta_keep.dtype
+                    dili_center = jnp.zeros((d,), dtype=dtype_theta)
+                    dili_basis = jnp.zeros((d, dili_rank), dtype=dtype_theta)
+                    dili_post_var = jnp.ones((dili_rank,), dtype=dtype_theta)
+                    dili_cov_ref = jnp.eye(d, dtype=dtype_theta)
+
+                # resample kept particles down to active set
+                rs_out, _status, key_c = resample_particles_jax(
+                    cur_rw,
+                    key=key_c,
+                    n_active=n_active,
+                    method_code=res_code_i32,
+                    reset_weights=True,
                 )
 
-                dili_geom = build_dili_pcn_geometry_jax(
-                    theta_gnh,
-                    w_gnh,
-                    local_gnh_fn=local_gnh_effective_fn,
-                    rank=dili_rank,
-                    gnh_floor=dili_gnh_floor,
-                    cov_floor=dili_cov_floor,
-                    complement_var=dili_complement_var,
+                # build input dictionary expected by mutation step
+                cur_for_mut = {
+                    "u": rs_out["u"],
+                    "x": rs_out["x"],
+                    "logdetj": rs_out["logdetj"],
+                    "logl": rs_out["logl"],
+                    "logp": rs_out["logp"],
+                    "logdetj_flow": jnp.zeros((n_active,), dtype=dtype),
+                    "blobs": rs_out["blobs"],
+                    "beta": cur_rw["beta"],
+                    "calls": cur_c["calls"],
+                    "proposal_scale": cur_c["proposal_scale"],
+                }
+
+                # run mutation step
+                key_c, mutated, _info = mutate(
+                    key_c,
+                    cur_for_mut,
+                    use_preconditioned_pcn=use_pcn,
+                    loglike_single_fn=loglike_wrapped,
+                    loglike_approx_single_fn=loglike_approx_wrapped,
+                    logprior_fn=prior.logpdf1,
+                    flow=stage_flow,
+                    scaler_cfg=scaler_cfg,
+                    scaler_masks=scaler_masks,
+                    # Existing pCN keeps the Student-t geometry.
+                    geom_mu=geom_new.t_mean,
+                    geom_cov=geom_new.t_cov,
+                    geom_nu=geom_new.t_nu,
+                    # LI-pCN uses the empirical weighted Gaussian geometry.
+                    li_geom_mu=geom_new.normal_mean,
+                    li_geom_cov=geom_new.normal_cov,
+                    kernel=kernel,
+                    li_rank=li_rank,
+                    li_lis_scale=li_lis_scale,
+                    li_cs_scale=li_cs_scale,
+                    li_var_floor=li_var_floor,
+                    li_complement_var=li_complement_var,
+                    dili_center=dili_center,
+                    dili_basis=dili_basis,
+                    dili_post_var=dili_post_var,
+                    dili_cov_ref=dili_cov_ref,
+                    dili_lis_scale=dili_lis_scale,
+                    dili_cs_scale=dili_cs_scale,
+                    n_max=n_max_steps,
+                    n_steps=n_steps,
+                    use_delayed_acceptance=jnp.asarray(cfg.delayed_acceptance),
+                    da_c_const=jnp.asarray(cfg.da_c_const, dtype=dtype),
+                    da_d_const=jnp.asarray(cfg.da_d_const, dtype=dtype),
+                    condition=None,
                 )
 
-                dili_center = dili_geom.center
-                dili_basis = dili_geom.basis
-                dili_post_var = dili_geom.post_var
-                dili_cov_ref = dili_geom.cov_ref
-            else:
-                # Static fallback. These values are not used unless kernel="dili_pcn",
-                # but keeping fixed shapes makes the mutate call simple.
-                d = theta_keep.shape[1]
-                dtype_theta = theta_keep.dtype
-                dili_center = jnp.zeros((d,), dtype=dtype_theta)
-                dili_basis = jnp.zeros((d, dili_rank), dtype=dtype_theta)
-                dili_post_var = jnp.ones((dili_rank,), dtype=dtype_theta)
-                dili_cov_ref = jnp.eye(d, dtype=dtype_theta)
+                # record new mutated particles into history
+                step = _build_step_from_particles(
+                    u=mutated["u"],
+                    x=mutated["x"],
+                    logdetj=mutated["logdetj"],
+                    logl=mutated["logl"],
+                    logp=mutated["logp"],
+                    blobs=mutated["blobs"],
+                    iter_idx=state_c.t,
+                    beta=cur_rw["beta"],
+                    logz=cur_rw["logz"],
+                    calls=mutated["calls"].astype(dtype),
+                    steps=mutated["steps"].astype(dtype),
+                    efficiency=mutated["efficiency"],
+                    ess=stats["ess"],
+                    accept=mutated["accept"],
+                )
+                next_state = record_step_jax(state_c, step)
 
-            # resample kept particles down to active set
-            rs_out, _status, key_c = resample_particles_jax(
-                cur_rw,
-                key=key_c,
-                n_active=n_active,
-                method_code=res_code_i32,
-                reset_weights=True,
-            )
+                # define next current particle dictionary
+                cur_next = {
+                    **mutated,
+                    "beta": cur_rw["beta"],
+                    "calls": mutated["calls"],
+                    "proposal_scale": mutated["proposal_scale"],
+                }
 
-            # build input dictionary expected by mutation step
-            cur_for_mut = {
-                "u": rs_out["u"],
-                "x": rs_out["x"],
-                "logdetj": rs_out["logdetj"],
-                "logl": rs_out["logl"],
-                "logp": rs_out["logp"],
-                "logdetj_flow": jnp.zeros((n_active,), dtype=dtype),
-                "blobs": rs_out["blobs"],
-                "beta": cur_rw["beta"],
-                "calls": cur_c["calls"],
-                "proposal_scale": cur_c["proposal_scale"],
-            }
+                return (key_c, next_state, cur_next, geom_new, n_eff_new, it + jnp.int32(1), fit)
 
-            # run mutation step
-            key_c, mutated, _info = mutate(
-                key_c,
-                cur_for_mut,
-                use_preconditioned_pcn=use_pcn,
-                loglike_single_fn=loglike_wrapped,
-                loglike_approx_single_fn=loglike_approx_wrapped,
-                logprior_fn=prior.logpdf1,
-                flow=flow_obj,
-                scaler_cfg=scaler_cfg,
-                scaler_masks=scaler_masks,
-                # Existing pCN keeps the Student-t geometry.
-                geom_mu=geom_new.t_mean,
-                geom_cov=geom_new.t_cov,
-                geom_nu=geom_new.t_nu,
-                # LI-pCN uses the empirical weighted Gaussian geometry.
-                li_geom_mu=geom_new.normal_mean,
-                li_geom_cov=geom_new.normal_cov,
-                kernel=kernel,
-                li_rank=li_rank,
-                li_lis_scale=li_lis_scale,
-                li_cs_scale=li_cs_scale,
-                li_var_floor=li_var_floor,
-                li_complement_var=li_complement_var,
-                dili_center=dili_center,
-                dili_basis=dili_basis,
-                dili_post_var=dili_post_var,
-                dili_cov_ref=dili_cov_ref,
-                dili_lis_scale=dili_lis_scale,
-                dili_cs_scale=dili_cs_scale,
-                n_max=n_max_steps,
-                n_steps=n_steps,
-                use_delayed_acceptance=jnp.asarray(cfg.delayed_acceptance),
-                da_c_const=jnp.asarray(cfg.da_c_const, dtype=dtype),
-                da_d_const=jnp.asarray(cfg.da_d_const, dtype=dtype),
-                condition=None,
-            )
-
-            # record new mutated particles into history
-            step = _build_step_from_particles(
-                u=mutated["u"],
-                x=mutated["x"],
-                logdetj=mutated["logdetj"],
-                logl=mutated["logl"],
-                logp=mutated["logp"],
-                blobs=mutated["blobs"],
-                iter_idx=state_c.t,
-                beta=cur_rw["beta"],
-                logz=cur_rw["logz"],
-                calls=mutated["calls"].astype(dtype),
-                steps=mutated["steps"].astype(dtype),
-                efficiency=mutated["efficiency"],
-                ess=stats["ess"],
-                accept=mutated["accept"],
-            )
-            state_c = record_step_jax(state_c, step)
-
-            # define next current particle dictionary
-            cur_next = {
-                **mutated,
-                "beta": cur_rw["beta"],
-                "calls": mutated["calls"],
-                "proposal_scale": mutated["proposal_scale"],
-            }
-
-            return (key_c, state_c, cur_next, geom_new, n_eff_new, it + jnp.int32(1))
+            if train_nfm:
+                return lax.cond(
+                    fit.fit_ok, finish_stage,
+                    lambda key: (key, state_c, cur_c, geom_c, n_eff_c2, it, fit),
+                    key_c,
+                )
+            return finish_stage(key_c)
 
         # run outer SMC loop
-        key, state, _cur, geom, n_eff_c, _itf = lax.while_loop(
+        initial_fit = NFMFitState.initial(flow_obj) if train_nfm else None
+        key, state, _cur, geom, n_eff_c, _itf, final_fit = lax.while_loop(
             cond_fn,
             body_fn,
-            (key, state, current_particles0, geom, n_eff_c, iter0),
+            (key, state, current_particles0, geom, n_eff_c, iter0, initial_fit),
         )
 
         # compute final log-evidence from stored history
@@ -1726,7 +1769,8 @@ def make_run_fn(
         )
         logz_err = jnp.asarray(jnp.nan, dtype=dtype)
 
-        return RunOutputJAX(state=state, logz=logz_final, logz_err=logz_err)
+        output = RunOutputJAX(state=state, logz=logz_final, logz_err=logz_err)
+        return output, final_fit.fit_ok if train_nfm else None
 
     def run(key: Array, n_total: int | None = None) -> RunOutputJAX:
         """
@@ -1753,7 +1797,7 @@ def make_run_fn(
         n_total_use = cfg.n_total if n_total is None else int(n_total)
 
         # run jitted core run function
-        return _run(
+        output, fit_ok = _run(
             key,
             n_total_dyn=jnp.asarray(n_total_use, dtype=jnp.float64),
             n_active=cfg.n_active,
@@ -1766,5 +1810,9 @@ def make_run_fn(
             trim_ess=cfg.trim_ess,
             blob_dim=cfg.blob_dim,
         )
+
+        if train_nfm and not bool(fit_ok):
+            raise FloatingPointError("NFM refresh failed before mutation")
+        return output
 
     return run

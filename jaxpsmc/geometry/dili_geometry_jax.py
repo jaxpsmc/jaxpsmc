@@ -153,8 +153,9 @@ def build_dili_pcn_geometry_jax(
     theta: Array,
     weights: Array,
     *,
-    local_gnh_fn: Callable[[Array], Array],
+    local_gnh_fn: Callable[..., Array],
     rank: int,
+    local_gnh_args: tuple = (),
     gnh_floor: float = 1e-10,
     cov_floor: float = 1e-8,
     complement_var: float = 1.0,
@@ -185,6 +186,9 @@ def build_dili_pcn_geometry_jax(
         Pure JAX function that maps one particle to a local GNH matrix.
         Input shape is (D,).
         Output shape must be (D, D).
+
+    local_gnh_args:
+        Dynamic arguments passed after theta, e.g. the current stage flow.
 
     rank:
         DILI rank r.
@@ -224,7 +228,7 @@ def build_dili_pcn_geometry_jax(
     center = jnp.sum(theta * weights[:, None], axis=0)
 
     # evaluate local GNH matrix at every selected particle
-    Hs = jax.vmap(local_gnh_fn, in_axes=0, out_axes=0)(theta)
+    Hs = jax.vmap(lambda row: local_gnh_fn(row, *local_gnh_args))(theta)
     # make every local GNH matrix symmetric PSD
     Hs = jax.vmap(lambda h: _project_psd_jax(h, gnh_floor_arr), in_axes=0, out_axes=0)(
         Hs

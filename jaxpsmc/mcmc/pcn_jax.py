@@ -11,7 +11,6 @@ from ..delayed_acceptance.da_conservative_damh_jax import (
 )
 from ..scaler_jax import (
     apply_boundary_conditions_x_jax,
-    forward_jax,
     inverse_jax,
 )
 from .flow_jax import _flow_theta_to_u_jax, _flow_u_to_theta_jax
@@ -579,13 +578,9 @@ def preconditioned_pcn_jax(
         # apply scaler inverse to move from u-space to x-space.
         x_prime, logdetj_prime = inverse_jax(u_prime, scaler_cfg, scaler_masks)
 
-        # apply boundary handling and recompute the consistent transformed values
-        x_prime_bc = apply_boundary_conditions_x_jax(x_prime, dict(scaler_cfg))
-        u_prime_bc = forward_jax(x_prime_bc, scaler_cfg, scaler_masks)
-        x_prime, logdetj_prime = inverse_jax(u_prime_bc, scaler_cfg, scaler_masks)
-
-        # keep boundary-corrected u values
-        u_prime = u_prime_bc
+        # The proposal lives in theta-space. Keep its inverse-flow coordinate
+        # and Jacobians even when the physical transform rounds to an endpoint.
+        x_prime = apply_boundary_conditions_x_jax(x_prime, dict(scaler_cfg))
 
         # mark proposals that are still finite after the scaler step
         finite0 = jnp.isfinite(logdetj_prime) & jnp.all(jnp.isfinite(x_prime), axis=1)

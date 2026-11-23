@@ -14,6 +14,7 @@ from ..sampler.mutate_jax import mutate
 from ..sampler.persistent_jax import reweight_step_persistent_jax
 from ..sampler.resample_jax import resample_particles_jax
 from ..sampler.reweight_jax import reweight_step_jax
+from ..sampler.sampler_jax import transform_nfm_history
 from ..sampler.termination_jax import not_termination_jax
 
 Array = jax.Array
@@ -56,6 +57,17 @@ class SMCDACarry(NamedTuple):
     geom: Geometry
     n_effective: Array
     iteration: Array
+
+
+class NFMSMCDACarry(NamedTuple):
+    """Adaptive scan input/output. Initialize fit with NFMFitState.initial(flow).
+
+    Inspect fit.fit_ok on return. Failed fits stop this scan before mutation.
+    Use the returned carry to resume with the same learned flow.
+    """
+
+    smc: SMCDACarry
+    fit: Any
 
 
 class SMCDAStepStats(NamedTuple):
@@ -167,12 +179,14 @@ def _step_mutated_particles_jax(
         "trim_ess",
         "sampling_mode",
         "mutation_fn",
+        "nfm_interval",
+        "nfm_optimizer_factory",
         "loglike_single_fn",
         "logprior_fn",
     ),
 )
 def smc_da_step_jax(
-    carry: SMCDACarry,
+    carry: SMCDACarry | NFMSMCDACarry,
     *,
     n_total: Array,
     metric_id: Array,
@@ -190,7 +204,9 @@ def smc_da_step_jax(
     bisect_steps: int,
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
-    flow: Any,
+    nfm_interval: int | None = None,
+    nfm_optimizer_factory: Callable | None = None,
+    flow: Any = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
     mutation_fn: Callable[
@@ -198,7 +214,7 @@ def smc_da_step_jax(
     ] = mutate,
     loglike_single_fn: Callable[[Array], tuple[Array, Array]],
     logprior_fn: Callable[[Array], Array],
-) -> tuple[SMCDACarry, SMCDAStepStats]:
+) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
     """
     Runs one outer SMC delayed-acceptance step.
 
@@ -257,8 +273,11 @@ def smc_da_step_jax(
         ESS trimming value used inside reweighting.
         This is static for JAX compilation.
     flow:
-        flow object used to transform particles from u-space to x-space.
-        It must provide flow.bijection.transform_and_log_det.
+        Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
+    nfm_interval:
+        Evaluate flow.config.training_interval(initial_n_effective, n_active) once.
+    nfm_optimizer_factory:
+        Static Optax factory used for stage-wise NFM training.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -276,7 +295,18 @@ def smc_da_step_jax(
     Tuple[SMCDACarry, SMCDAStepStats]:
         updated carry and diagnostic statistics for this SMC-DA step.
     """
-    _key, state, cur, _geom, _n_eff, it = carry
+    adaptive = isinstance(carry, NFMSMCDACarry)
+    if adaptive:
+        from ..normalizing_flow.nfm import refresh_nfm
+        if nfm_interval is None or nfm_interval < 1 or nfm_optimizer_factory is None:
+            raise ValueError("adaptive scan requires the initial training interval and optimizer factory")
+    elif nfm_interval is not None or nfm_optimizer_factory is not None:
+        raise ValueError("adaptive scan requires NFMSMCDACarry")
+
+    if not adaptive and flow is None:
+        raise ValueError("a fixed-flow scan requires flow")
+    smc = carry.smc if adaptive else carry
+    _key, state, cur, _geom, _n_eff, it = smc
     dtype = state.logl.dtype
 
     active = not_termination_jax(
@@ -287,7 +317,7 @@ def smc_da_step_jax(
         n_active=n_active_i32,
     ) & (it < jnp.asarray(n_outer_max_steps, dtype=it.dtype))
 
-    def do_step(op: SMCDACarry) -> tuple[SMCDACarry, SMCDAStepStats]:
+    def do_step(op: SMCDACarry | NFMSMCDACarry) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
         """
         Performs one active SMC update.
 
@@ -304,7 +334,8 @@ def smc_da_step_jax(
         Tuple[SMCDACarry, SMCDAStepStats]:
             updated carry and active step statistics.
         """
-        key_c, state_c, cur_c, geom_c, n_eff_c, it_c = op
+        current = op.smc if adaptive else op
+        key_c, state_c, cur_c, geom_c, n_eff_c, it_c = current
 
         sampling_mode_l = str(sampling_mode).lower()
         if sampling_mode_l == "persistent":
@@ -329,122 +360,126 @@ def smc_da_step_jax(
             trim_ess=trim_ess,
         )
 
-        def u_to_theta(ui: Array) -> tuple[Array, Array]:
-            """
-            Transforms one particle from u-space to theta-space.
+        if adaptive:
+            key_c, fit_key = jax.random.split(key_c)
+            fit = refresh_nfm(
+                op.fit, cur_rw["u"], cur_rw["weights"], fit_key,
+                iteration=state_c.t + 1, beta=cur_rw["beta"],
+                interval=nfm_interval, optimizer_factory=nfm_optimizer_factory,
+            )
+        stage_flow = fit.flow if adaptive else flow
 
-            Parameters:
-            -----------
-            ui:
-                one particle in u-space, shape (D,).
+        def finish_stage(key_c):
+            transform = stage_flow.bijection.transform_and_log_det
+            if adaptive:
+                theta_keep = transform_nfm_history(
+                    stage_flow, cur_rw["u"], sampling_mode_l, state_c.t, state_c.u.shape[1]
+                )
+            else:
+                theta_keep, _ = jax.vmap(lambda row: transform(row, None))(cur_rw["u"])
 
-            Returns:
-            --------
-            Tuple[Array, Array]:
-                transformed particle and log determinant value.
-            """
-            theta_i, logdet_i = flow.bijection.transform_and_log_det(ui, None)
-            return theta_i, logdet_i
+            geom_new, key_c, _ = geometry_fit_jax(
+                geom_c,
+                theta_keep,
+                cur_rw["weights"],
+                use_weights=jnp.asarray(True),
+                key=key_c,
+            )
 
-        theta_keep, _ = jax.vmap(u_to_theta, in_axes=0, out_axes=(0, 0))(cur_rw["u"])
+            rs_out, _rs_status, key_c = resample_particles_jax(
+                cur_rw,
+                key=key_c,
+                n_active=n_active,
+                method_code=resample_code,
+                reset_weights=True,
+            )
 
-        geom_new, key_c, _ = geometry_fit_jax(
-            geom_c,
-            theta_keep,
-            cur_rw["weights"],
-            use_weights=jnp.asarray(True),
-            key=key_c,
-        )
+            cur_for_mut = {
+                "u": rs_out["u"],
+                "x": rs_out["x"],
+                "logdetj": rs_out["logdetj"],
+                "logl": rs_out["logl"],
+                "logp": rs_out["logp"],
+                "logdetj_flow": jnp.zeros((n_active,), dtype=dtype),
+                "blobs": rs_out["blobs"],
+                "beta": cur_rw["beta"],
+                "calls": cur_c["calls"],
+                "proposal_scale": cur_c["proposal_scale"],
+            }
 
-        rs_out, _rs_status, key_c = resample_particles_jax(
-            cur_rw,
-            key=key_c,
-            n_active=n_active,
-            method_code=resample_code,
-            reset_weights=True,
-        )
+            key_c, mutated, _info = mutation_fn(
+                key_c,
+                cur_for_mut,
+                use_preconditioned_pcn=use_preconditioned_pcn,
+                loglike_single_fn=loglike_single_fn,
+                logprior_fn=logprior_fn,
+                flow=stage_flow,
+                scaler_cfg=scaler_cfg,
+                scaler_masks=scaler_masks,
+                geom_mu=geom_new.t_mean,
+                geom_cov=geom_new.t_cov,
+                geom_nu=geom_new.t_nu,
+                n_max=n_mutation_max_steps,
+                n_steps=n_mutation_steps,
+                condition=None,
+            )
 
-        cur_for_mut = {
-            "u": rs_out["u"],
-            "x": rs_out["x"],
-            "logdetj": rs_out["logdetj"],
-            "logl": rs_out["logl"],
-            "logp": rs_out["logp"],
-            "logdetj_flow": jnp.zeros((n_active,), dtype=dtype),
-            "blobs": rs_out["blobs"],
-            "beta": cur_rw["beta"],
-            "calls": cur_c["calls"],
-            "proposal_scale": cur_c["proposal_scale"],
-        }
+            step = _step_mutated_particles_jax(
+                mutated=mutated,
+                iter_idx=state_c.t,
+                beta=cur_rw["beta"],
+                logz=cur_rw["logz"],
+                ess=rw_stats["ess"],
+            )
 
-        key_c, mutated, _info = mutation_fn(
-            key_c,
-            cur_for_mut,
-            use_preconditioned_pcn=use_preconditioned_pcn,
-            loglike_single_fn=loglike_single_fn,
-            logprior_fn=logprior_fn,
-            flow=flow,
-            scaler_cfg=scaler_cfg,
-            scaler_masks=scaler_masks,
-            geom_mu=geom_new.t_mean,
-            geom_cov=geom_new.t_cov,
-            geom_nu=geom_new.t_nu,
-            n_max=n_mutation_max_steps,
-            n_steps=n_mutation_steps,
-            condition=None,
-        )
+            state_new = record_step_jax(state_c, step)
 
-        step = _step_mutated_particles_jax(
-            mutated=mutated,
-            iter_idx=state_c.t,
-            beta=cur_rw["beta"],
-            logz=cur_rw["logz"],
-            ess=rw_stats["ess"],
-        )
+            # cur_next = {
+            #    **mutated,
+            #    "beta": cur_rw["beta"],
+            #    "calls": mutated["calls"],
+            #    "proposal_scale": mutated["proposal_scale"],
+            # }
 
-        state_new = record_step_jax(state_c, step)
+            cur_next = {
+                "u": mutated["u"],
+                "x": mutated["x"],
+                "logdetj": mutated["logdetj"],
+                "logl": mutated["logl"],
+                "logp": mutated["logp"],
+                "blobs": mutated["blobs"],
+                "beta": cur_rw["beta"],
+                "calls": mutated["calls"],
+                "proposal_scale": mutated["proposal_scale"],
+            }
 
-        # cur_next = {
-        #    **mutated,
-        #    "beta": cur_rw["beta"],
-        #    "calls": mutated["calls"],
-        #    "proposal_scale": mutated["proposal_scale"],
-        # }
+            carry_next = SMCDACarry(
+                key=key_c,
+                state=state_new,
+                current_particles=cur_next,
+                geom=geom_new,
+                n_effective=n_eff_new,
+                iteration=it_c + jnp.asarray(1, dtype=it_c.dtype),
+            )
 
-        cur_next = {
-            "u": mutated["u"],
-            "x": mutated["x"],
-            "logdetj": mutated["logdetj"],
-            "logl": mutated["logl"],
-            "logp": mutated["logp"],
-            "blobs": mutated["blobs"],
-            "beta": cur_rw["beta"],
-            "calls": mutated["calls"],
-            "proposal_scale": mutated["proposal_scale"],
-        }
+            stats = SMCDAStepStats(
+                active=jnp.asarray(True),
+                beta=cur_rw["beta"],
+                logz=cur_rw["logz"],
+                ess=rw_stats["ess"],
+                accept=mutated["accept"],
+                steps=mutated["steps"],
+                calls=mutated["calls"],
+            )
 
-        carry_next = SMCDACarry(
-            key=key_c,
-            state=state_new,
-            current_particles=cur_next,
-            geom=geom_new,
-            n_effective=n_eff_new,
-            iteration=it_c + jnp.asarray(1, dtype=it_c.dtype),
-        )
+            return (NFMSMCDACarry(carry_next, fit) if adaptive else carry_next), stats
 
-        stats = SMCDAStepStats(
-            active=jnp.asarray(True),
-            beta=cur_rw["beta"],
-            logz=cur_rw["logz"],
-            ess=rw_stats["ess"],
-            accept=mutated["accept"],
-            steps=mutated["steps"],
-            calls=mutated["calls"],
-        )
+        if adaptive:
+            failed = NFMSMCDACarry(current._replace(key=key_c), fit)
+            return lax.cond(fit.fit_ok, finish_stage, lambda _: skip_step(failed), key_c)
+        return finish_stage(key_c)
 
-        return carry_next, stats
-
-    def skip_step(op: SMCDACarry) -> tuple[SMCDACarry, SMCDAStepStats]:
+    def skip_step(op: SMCDACarry | NFMSMCDACarry) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
         """
         Returns the carry unchanged when the sampler is inactive.
 
@@ -461,7 +496,7 @@ def smc_da_step_jax(
         Tuple[SMCDACarry, SMCDAStepStats]:
             unchanged carry and inactive step statistics.
         """
-        _key, _state, cur_c, _geom, _n_eff, _it = op
+        _key, _state, cur_c, _geom, _n_eff, _it = op.smc if adaptive else op
         zero_f = jnp.asarray(0.0, dtype=dtype)
         zero_i = jnp.asarray(0, dtype=jnp.int32)
 
@@ -477,6 +512,8 @@ def smc_da_step_jax(
 
         return op, stats
 
+    if adaptive:
+        active = active & carry.fit.fit_ok
     return lax.cond(active, do_step, skip_step, carry)
 
 
@@ -494,12 +531,14 @@ def smc_da_step_jax(
         "sampling_mode",
         "trim_ess",
         "mutation_fn",
+        "nfm_interval",
+        "nfm_optimizer_factory",
         "loglike_single_fn",
         "logprior_fn",
     ),
 )
 def run_smc_da_scan_jax(
-    carry0: SMCDACarry,
+    carry0: SMCDACarry | NFMSMCDACarry,
     *,
     n_scan_steps: int,
     n_total: Array,
@@ -518,7 +557,9 @@ def run_smc_da_scan_jax(
     bisect_steps: int,
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
-    flow: Any,
+    nfm_interval: int | None = None,
+    nfm_optimizer_factory: Callable | None = None,
+    flow: Any = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
     mutation_fn: Callable[
@@ -526,7 +567,7 @@ def run_smc_da_scan_jax(
     ] = mutate,
     loglike_single_fn: Callable[[Array], tuple[Array, Array]],
     logprior_fn: Callable[[Array], Array],
-) -> tuple[SMCDACarry, SMCDAStepStats]:
+) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
     """
     Runs several SMC-DA steps with JAX scan.
 
@@ -578,8 +619,11 @@ def run_smc_da_scan_jax(
         ESS trimming value used inside reweighting.
         This is static for JAX compilation.
     flow:
-        flow object used to transform particles from u-space to x-space.
-        It must provide flow.bijection.transform_and_log_det.
+        Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
+    nfm_interval:
+        Evaluate flow.config.training_interval(initial_n_effective, n_active) once.
+    nfm_optimizer_factory:
+        Static Optax factory used for stage-wise NFM training.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -599,9 +643,9 @@ def run_smc_da_scan_jax(
     """
 
     def scan_body(
-        carry: SMCDACarry,
+        carry: SMCDACarry | NFMSMCDACarry,
         _: Array,
-    ) -> tuple[SMCDACarry, SMCDAStepStats]:
+    ) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
         """
         Runs one scan iteration.
 
@@ -642,6 +686,8 @@ def run_smc_da_scan_jax(
             scaler_cfg=scaler_cfg,
             scaler_masks=scaler_masks,
             mutation_fn=mutation_fn,
+            nfm_interval=nfm_interval,
+            nfm_optimizer_factory=nfm_optimizer_factory,
             loglike_single_fn=loglike_single_fn,
             logprior_fn=logprior_fn,
         )
