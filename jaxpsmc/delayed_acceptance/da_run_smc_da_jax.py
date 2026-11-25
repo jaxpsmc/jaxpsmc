@@ -60,7 +60,7 @@ class SMCDACarry(NamedTuple):
 
 
 class NFMSMCDACarry(NamedTuple):
-    """Adaptive scan input/output. Initialize fit with NFMFitState.initial(flow).
+    """Adaptive scan input/output. Initialize fit with NFMFitState.initial(flow, initial_n_effective).
 
     Inspect fit.fit_ok on return. Failed fits stop this scan before mutation.
     Use the returned carry to resume with the same learned flow.
@@ -179,8 +179,6 @@ def _step_mutated_particles_jax(
         "trim_ess",
         "sampling_mode",
         "mutation_fn",
-        "nfm_interval",
-        "nfm_optimizer_factory",
         "loglike_single_fn",
         "logprior_fn",
     ),
@@ -204,8 +202,6 @@ def smc_da_step_jax(
     bisect_steps: int,
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
-    nfm_interval: int | None = None,
-    nfm_optimizer_factory: Callable | None = None,
     flow: Any = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
@@ -274,10 +270,6 @@ def smc_da_step_jax(
         This is static for JAX compilation.
     flow:
         Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
-    nfm_interval:
-        Evaluate flow.config.training_interval(initial_n_effective, n_active) once.
-    nfm_optimizer_factory:
-        Static Optax factory used for stage-wise NFM training.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -298,10 +290,6 @@ def smc_da_step_jax(
     adaptive = isinstance(carry, NFMSMCDACarry)
     if adaptive:
         from ..normalizing_flow.nfm import refresh_nfm
-        if nfm_interval is None or nfm_interval < 1 or nfm_optimizer_factory is None:
-            raise ValueError("adaptive scan requires the initial training interval and optimizer factory")
-    elif nfm_interval is not None or nfm_optimizer_factory is not None:
-        raise ValueError("adaptive scan requires NFMSMCDACarry")
 
     if not adaptive and flow is None:
         raise ValueError("a fixed-flow scan requires flow")
@@ -365,7 +353,7 @@ def smc_da_step_jax(
             fit = refresh_nfm(
                 op.fit, cur_rw["u"], cur_rw["weights"], fit_key,
                 iteration=state_c.t + 1, beta=cur_rw["beta"],
-                interval=nfm_interval, optimizer_factory=nfm_optimizer_factory,
+                n_active=n_active,
             )
         stage_flow = fit.flow if adaptive else flow
 
@@ -419,8 +407,8 @@ def smc_da_step_jax(
                 geom_mu=geom_new.t_mean,
                 geom_cov=geom_new.t_cov,
                 geom_nu=geom_new.t_nu,
-                n_max=n_mutation_max_steps,
-                n_steps=n_mutation_steps,
+                n_max=stage_flow.config.mutation_cap if adaptive else n_mutation_max_steps,
+                n_steps=stage_flow.config.mutation_steps if adaptive else n_mutation_steps,
                 condition=None,
             )
 
@@ -531,8 +519,6 @@ def smc_da_step_jax(
         "sampling_mode",
         "trim_ess",
         "mutation_fn",
-        "nfm_interval",
-        "nfm_optimizer_factory",
         "loglike_single_fn",
         "logprior_fn",
     ),
@@ -557,8 +543,6 @@ def run_smc_da_scan_jax(
     bisect_steps: int,
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
-    nfm_interval: int | None = None,
-    nfm_optimizer_factory: Callable | None = None,
     flow: Any = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
@@ -620,10 +604,6 @@ def run_smc_da_scan_jax(
         This is static for JAX compilation.
     flow:
         Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
-    nfm_interval:
-        Evaluate flow.config.training_interval(initial_n_effective, n_active) once.
-    nfm_optimizer_factory:
-        Static Optax factory used for stage-wise NFM training.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -686,8 +666,6 @@ def run_smc_da_scan_jax(
             scaler_cfg=scaler_cfg,
             scaler_masks=scaler_masks,
             mutation_fn=mutation_fn,
-            nfm_interval=nfm_interval,
-            nfm_optimizer_factory=nfm_optimizer_factory,
             loglike_single_fn=loglike_single_fn,
             logprior_fn=logprior_fn,
         )

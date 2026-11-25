@@ -582,7 +582,7 @@ class SamplerConfigJAX:
             raise ValueError("kernel must be one of: 'pcn', 'li_pcn', 'dili_pcn'.")
         if self.dili_rank <= 0:
             raise ValueError("dili_rank must be positive.")
-        if self.dili_rank > self.n_dim:
+        if kernel_l == "dili_pcn" and self.dili_rank > self.n_dim:
             raise ValueError("dili_rank must be <= n_dim.")
         if self.dili_n_lis_particles <= 0:
             raise ValueError("dili_n_lis_particles must be positive.")
@@ -735,7 +735,7 @@ class SamplerJAX:
         flow: Any | None = None,
         loglike_approx_single_fn: Callable[[Array], Any] | None = None,
         local_gnh_fn: Callable[[Array], Array] | None = None,
-        nfm_optimizer_factory: Callable | None = None,
+        adaptive_nfm: bool = False,
     ):
         """
         Initializes the sampler wrapper.
@@ -758,8 +758,8 @@ class SamplerJAX:
         flow:
             optional flow object.
             If None, IdentityFlowJAX is used.
-        nfm_optimizer_factory:
-            Pass an Optax optimizer factory together with an initialized NFMFlow
+        adaptive_nfm:
+            Set True together with an initialized NFMFlow
             to fit that map on the retained weighted particles during this run.
         loglike_approx_single_fn:
             optional approximate likelihood function.
@@ -796,7 +796,7 @@ class SamplerJAX:
             loglike_approx_single_fn=loglike_approx_single_fn,
             cfg=cfg,
             flow=self.flow,
-            nfm_optimizer_factory=nfm_optimizer_factory,
+            adaptive_nfm=adaptive_nfm,
             local_gnh_fn=local_gnh_fn,
         )
 
@@ -1014,7 +1014,7 @@ def make_run_fn(
     cfg: SamplerConfigJAX,
     flow: Any | None = None,
     local_gnh_fn: Callable[[Array], Array] | None = None,
-    nfm_optimizer_factory: Callable | None = None,
+    adaptive_nfm: bool = False,
 ) -> _RunFunction:
     """
     Builds the sampler run function.
@@ -1058,15 +1058,14 @@ def make_run_fn(
 
     # static kernel/config values captured by the jitted run function
     kernel = str(cfg.kernel).lower()
-    # Supply an initialized NFMFlow and an explicit Optax optimizer factory
+    # Supply an initialized NFMFlow and enable adaptive fitting
     # to enable same-run training. Other flows remain fixed as before.
-    train_nfm = nfm_optimizer_factory is not None
+    train_nfm = adaptive_nfm
     if train_nfm:
         from ..normalizing_flow.nfm import NFMFitState, NFMFlow, refresh_nfm
 
         if not isinstance(flow_obj, NFMFlow) or flow_obj.config.n_dim != cfg.n_dim:
             raise ValueError("adaptive fitting requires an NFMFlow with cfg.n_dim coordinates")
-        interval = flow_obj.config.training_interval(cfg.n_effective, cfg.n_active)
 
     use_pcn_bool = bool(cfg.preconditioned)
 
@@ -1594,7 +1593,7 @@ def make_run_fn(
                 fit = refresh_nfm(
                     fit, cur_rw["u"], cur_rw["weights"], fit_key,
                     iteration=state_c.t + 1, beta=cur_rw["beta"],
-                    interval=interval, optimizer_factory=nfm_optimizer_factory,
+                    n_active=n_active,
                 )
             stage_flow = fit.flow if train_nfm else flow_obj
 
@@ -1708,8 +1707,8 @@ def make_run_fn(
                     dili_cov_ref=dili_cov_ref,
                     dili_lis_scale=dili_lis_scale,
                     dili_cs_scale=dili_cs_scale,
-                    n_max=n_max_steps,
-                    n_steps=n_steps,
+                    n_max=stage_flow.config.mutation_cap if train_nfm else n_max_steps,
+                    n_steps=stage_flow.config.mutation_steps if train_nfm else n_steps,
                     use_delayed_acceptance=jnp.asarray(cfg.delayed_acceptance),
                     da_c_const=jnp.asarray(cfg.da_c_const, dtype=dtype),
                     da_d_const=jnp.asarray(cfg.da_d_const, dtype=dtype),
@@ -1754,7 +1753,7 @@ def make_run_fn(
             return finish_stage(key_c)
 
         # run outer SMC loop
-        initial_fit = NFMFitState.initial(flow_obj) if train_nfm else None
+        initial_fit = NFMFitState.initial(flow_obj, cfg.n_effective) if train_nfm else None
         key, state, _cur, geom, n_eff_c, _itf, final_fit = lax.while_loop(
             cond_fn,
             body_fn,
