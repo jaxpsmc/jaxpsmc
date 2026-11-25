@@ -4,8 +4,6 @@ The objective follows nfm/objectives/nfmd.py at the revision in model.py.
 Particle weights enter once, in the reduction over each shuffled minibatch.
 """
 
-from collections.abc import Callable
-from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -21,10 +19,13 @@ class NFMFitState(NamedTuple):
     flow: NFMFlow
     fitted: jax.Array
     fit_ok: jax.Array
+    initial_n_effective: jax.Array
+    last_fit_epochs: jax.Array
 
     @classmethod
-    def initial(cls, flow: NFMFlow):
-        return cls(flow, jnp.asarray(False), jnp.asarray(True))
+    def initial(cls, flow: NFMFlow, initial_n_effective):
+        return cls(flow, jnp.asarray(False), jnp.asarray(True),
+                   jnp.asarray(initial_n_effective, jnp.int32), jnp.int32(0))
 
 
 def _batch_loss(flow, particles, weights, key):
@@ -42,83 +43,121 @@ def _batch_loss(flow, particles, weights, key):
     return jnp.sum(per_particle * (scaled / scaled.sum()))
 
 
-@partial(jax.jit, static_argnames=("interval", "optimizer_factory"))
-def refresh_nfm(
-    state: NFMFitState,
-    particles: jax.Array,
-    weights: jax.Array,
-    key: jax.Array,
-    *,
-    iteration: jax.Array,
-    beta: jax.Array,
-    interval: int,
-    optimizer_factory: Callable[[float], optax.GradientTransformation],
-) -> NFMFitState:
-    """Refresh after reweighting and before geometry fitting/resampling.
 
-    Supply the selected mode's retained u-space rows and weights, and a
-    dedicated fit key. iteration is PocoMC's post-reweight counter, including
-    completed warmup batches. Compute interval once with config.training_interval.
-    The optimizer factory takes config.learning_rate and must be JIT-static.
-    A caller must inspect fit_ok after each refresh before continuing sampling.
-    A skipped stage returns the input state. The sampler owns its random stream.
-    """
-    cfg = state.flow.config
+def _run_epochs(flow, moments, epoch_fn, patience, dtype, limit=5000):
+    """Keep best validation checkpoint; at the epoch limit use the final iterate."""
+    def active(carry):
+        epoch, _, _, _, _, stale, finite = carry
+        return (epoch < limit) & (stale < patience) & finite
+
+    def step(carry):
+        epoch, current, moments, best, best_loss, stale, _ = carry
+        current, moments, loss = epoch_fn(epoch, current, moments)
+        improved = loss < best_loss
+        best = jax.lax.cond(improved, lambda: current, lambda: best)
+        return (epoch + 1, current, moments, best, jnp.minimum(loss, best_loss),
+                jnp.where(improved, 0, stale + 1), jnp.isfinite(loss))
+
+    start = (jnp.int32(0), flow, moments, flow, jnp.asarray(jnp.inf, dtype),
+             jnp.int32(0), jnp.asarray(True))
+    epochs, final, _, best, _, stale, finite = jax.lax.while_loop(active, step, start)
+    selected = jax.lax.cond(stale >= patience, lambda: best, lambda: final)
+    return selected, epochs, finite
+
+
+def _logical_batch_size(initial_n_effective, count):
+    # A singleton effective-size target still needs one row per update.
+    return jnp.maximum(1, jnp.minimum(512, jnp.minimum(initial_n_effective // 2, count // 2)))
+
+
+def _fit_partition(state, particles, weights, key, count):
+    capacity = len(weights)
+    split_key, epoch_key = jax.random.split(key)
+    permutation = jax.random.permutation(split_key, capacity)
+    slots = jnp.nonzero(weights[permutation] > 0, size=capacity, fill_value=0)[0]
+    rows = permutation[slots]
+    n_train = count // 2
+    n_valid = count - n_train
+    width = max(1, min(512, capacity // 2))
+    batch_size = _logical_batch_size(state.initial_n_effective, count)
+    offsets = jnp.arange(width, dtype=jnp.int32)
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3, weight_decay=0.0))
+    gradient = jax.grad(_batch_loss)
+    dtype = jnp.result_type(particles, weights)
+
+    def shuffled_indices(key, start, size, max_size):
+        # Randomize the order within this fixed holdout partition only.
+        order = jax.random.permutation(key, max_size)
+        valid = jnp.nonzero(order < size, size=max_size, fill_value=0)[0]
+        return rows[start + order[valid]]
+
+    def batch(indices, size, i):
+        pos = i * batch_size + offsets
+        idx = indices[jnp.minimum(pos, size - 1)]
+        mass = jnp.where((offsets < batch_size) & (pos < size), weights[idx], 0)
+        return particles[idx], mass
+
+    def epoch(epoch_id, flow, moments):
+        kt, kv, noise = jax.random.split(jax.random.fold_in(epoch_key, epoch_id), 3)
+        train = shuffled_indices(kt, 0, n_train, capacity // 2)
+        valid = shuffled_indices(kv, n_train, n_valid, (capacity + 1) // 2)
+
+        def update(i, carry):
+            current, opt_state = carry
+            x, w = batch(train, n_train, i)
+            grad = gradient(current, x, w, jax.random.fold_in(noise, i))
+            delta, opt_state = optimizer.update(grad, opt_state, current)
+            return optax.apply_updates(current, delta), opt_state
+
+        flow, moments = jax.lax.fori_loop(
+            0, (n_train + batch_size - 1) // batch_size, update, (flow, moments)
+        )
+
+        def score(i, total):
+            x, w = batch(valid, n_valid, i)
+            z, logdet = flow.transform_and_log_det(x)
+            dimension = flow.config.n_dim
+            nll = 0.5 * (jnp.sum(z * z, axis=-1) + dimension * jnp.log(2 * jnp.pi)) - logdet
+            # PocoMC first normalizes weights within each validation batch.
+            scaled = w / w.max()
+            return total + 1000 * jnp.sum((scaled / scaled.sum()) * nll)
+
+        loss = jax.lax.fori_loop(0, (n_valid + batch_size - 1) // batch_size,
+                                 score, jnp.zeros((), dtype)) / n_valid
+        return flow, moments, loss
+
+    selected, epochs, ok = _run_epochs(state.flow, optimizer.init(state.flow), epoch,
+                                       state.flow.config.stale_epochs, dtype)
+    ok &= jnp.all(jnp.stack([jnp.all(jnp.isfinite(p)) for p in jax.tree.leaves(selected)]))
+    return jax.lax.cond(
+        ok, lambda: state._replace(flow=selected, fitted=ok, fit_ok=ok, last_fit_epochs=epochs),
+        lambda: state._replace(fit_ok=ok, last_fit_epochs=epochs),
+    )
+
+
+@jax.jit
+def refresh_nfm(state, particles, weights, key, *, iteration, beta, n_active):
+    """Fit on retained positive-mass rows after reweighting and before mutation."""
     particles, weights = jnp.asarray(particles), jnp.asarray(weights)
-    if particles.ndim != 2 or particles.shape[1] != cfg.n_dim or not particles.shape[0]:
-        raise ValueError("particles must have shape (capacity, n_dim) with positive capacity")
-    if weights.shape != (particles.shape[0],):
-        raise ValueError("weights must have one entry per particle")
+    if particles.ndim != 2 or particles.shape[1] != state.flow.config.n_dim:
+        raise ValueError("particles must be a matrix with n_dim columns")
+    if weights.shape != (particles.shape[0],) or not len(weights):
+        raise ValueError("weights must have one entry per row and positive capacity")
     if particles.dtype not in (jnp.float32, jnp.float64) or not jnp.issubdtype(weights.dtype, jnp.floating):
-        raise TypeError("expected float32/float64 particles and floating-point weights")
-    if interval < 1:
-        raise ValueError("interval must be positive")
+        raise TypeError("expected float32/float64 coordinates and floating-point weights")
 
-    def fit(old):
+    def refresh(old):
         positive = weights > 0
         count = jnp.sum(positive, dtype=jnp.int32)
-        valid = (
-            (count > 0) & jnp.all(jnp.isfinite(weights) & (weights >= 0))
-            & jnp.all(~positive[:, None] | jnp.isfinite(particles))
-        )
-        width = min(cfg.batch_size, particles.shape[0])
-        offsets = jnp.arange(width, dtype=jnp.int32)
+        valid = (jnp.all(jnp.isfinite(weights) & (weights >= 0))
+                 & jnp.all(~positive[:, None] | jnp.isfinite(particles))
+                 & (old.initial_n_effective > 0) & (n_active > 0))
+        if len(weights) < 2:
+            return old._replace(fit_ok=valid)
+        return jax.lax.cond(valid & (count >= 2),
+                            lambda: _fit_partition(old, particles, weights, key, count),
+                            lambda: old._replace(fit_ok=valid))
 
-        def train(_):
-            optimizer = optimizer_factory(cfg.learning_rate)
-            grad_loss = jax.grad(_batch_loss)
-
-            def epoch(epoch_id, carry):
-                epoch_key = jax.random.fold_in(key, epoch_id)
-                order_key, batch_key = jax.random.split(epoch_key)
-                order = jax.random.permutation(order_key, particles.shape[0])
-                # Compact shuffled indices, not the particle matrix. The inner
-                # loop runs only over positive-mass rows even for padded history.
-                slots = jnp.nonzero(positive[order], size=particles.shape[0], fill_value=0)[0]
-                indices = order[slots]
-
-                def step(batch_id, carry):
-                    flow, moments = carry
-                    positions = batch_id * width + offsets
-                    rows = indices[jnp.minimum(positions, count - 1)]
-                    batch_weights = jnp.where(positions < count, weights[rows], 0)
-                    grads = grad_loss(flow, particles[rows], batch_weights,
-                                      jax.random.fold_in(batch_key, batch_id))
-                    updates, moments = optimizer.update(grads, moments, flow)
-                    return optax.apply_updates(flow, updates), moments
-
-                return jax.lax.fori_loop(0, (count + width - 1) // width, step, carry)
-
-            flow, _ = jax.lax.fori_loop(
-                0, cfg.epochs, epoch, (old.flow, optimizer.init(old.flow))
-            )
-            finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(p)) for p in jax.tree.leaves(flow)]))
-            return jax.lax.cond(
-                finite, lambda: NFMFitState(flow, jnp.asarray(True), finite),
-                lambda: old._replace(fit_ok=finite),
-            )
-
-        return jax.lax.cond(valid, train, lambda _: old._replace(fit_ok=valid), None)
-
-    due = (~state.fitted) | (jnp.asarray(iteration) % interval == 0) | (jnp.asarray(beta) == 1)
-    return jax.lax.cond(due, fit, lambda old: old, state)
+    interval = jnp.maximum(1, state.initial_n_effective // (2 * n_active))
+    due = (~state.fitted) | (iteration % interval == 0) | (beta == 1)
+    return jax.lax.cond(due, refresh, lambda old: old, state)
