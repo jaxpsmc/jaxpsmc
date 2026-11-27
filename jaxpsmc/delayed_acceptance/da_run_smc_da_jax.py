@@ -14,7 +14,7 @@ from ..sampler.mutate_jax import mutate
 from ..sampler.persistent_jax import reweight_step_persistent_jax
 from ..sampler.resample_jax import resample_particles_jax
 from ..sampler.reweight_jax import reweight_step_jax
-from ..sampler.sampler_jax import transform_nfm_history
+from ..sampler.sampler_jax import adaptive_flow_policy, transform_flow_history
 from ..sampler.termination_jax import not_termination_jax
 
 Array = jax.Array
@@ -59,8 +59,8 @@ class SMCDACarry(NamedTuple):
     iteration: Array
 
 
-class NFMSMCDACarry(NamedTuple):
-    """Adaptive scan input/output. Initialize fit with NFMFitState.initial(flow, initial_n_effective).
+class AdaptiveSMCDACarry(NamedTuple):
+    """Adaptive scan input/output. Initialize fit with the model's fit-state initializer.
 
     Inspect fit.fit_ok on return. Failed fits stop this scan before mutation.
     Use the returned carry to resume with the same learned flow.
@@ -68,6 +68,9 @@ class NFMSMCDACarry(NamedTuple):
 
     smc: SMCDACarry
     fit: Any
+
+
+NFMSMCDACarry = AdaptiveSMCDACarry  # Backwards-compatible public name.
 
 
 class SMCDAStepStats(NamedTuple):
@@ -184,7 +187,7 @@ def _step_mutated_particles_jax(
     ),
 )
 def smc_da_step_jax(
-    carry: SMCDACarry | NFMSMCDACarry,
+    carry: SMCDACarry | AdaptiveSMCDACarry,
     *,
     n_total: Array,
     metric_id: Array,
@@ -210,7 +213,7 @@ def smc_da_step_jax(
     ] = mutate,
     loglike_single_fn: Callable[[Array], tuple[Array, Array]],
     logprior_fn: Callable[[Array], Array],
-) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
+) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
     """
     Runs one outer SMC delayed-acceptance step.
 
@@ -269,7 +272,7 @@ def smc_da_step_jax(
         ESS trimming value used inside reweighting.
         This is static for JAX compilation.
     flow:
-        Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
+        Fixed flow for SMCDACarry. Adaptive calls use the flow in AdaptiveSMCDACarry.fit.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -287,9 +290,11 @@ def smc_da_step_jax(
     Tuple[SMCDACarry, SMCDAStepStats]:
         updated carry and diagnostic statistics for this SMC-DA step.
     """
-    adaptive = isinstance(carry, NFMSMCDACarry)
+    adaptive = isinstance(carry, AdaptiveSMCDACarry)
     if adaptive:
-        from ..normalizing_flow.nfm import refresh_nfm
+        refresh, adaptive_steps, adaptive_cap = adaptive_flow_policy(
+            carry.fit.flow, carry.smc.state.u.shape[-1]
+        )
 
     if not adaptive and flow is None:
         raise ValueError("a fixed-flow scan requires flow")
@@ -305,7 +310,7 @@ def smc_da_step_jax(
         n_active=n_active_i32,
     ) & (it < jnp.asarray(n_outer_max_steps, dtype=it.dtype))
 
-    def do_step(op: SMCDACarry | NFMSMCDACarry) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
+    def do_step(op: SMCDACarry | AdaptiveSMCDACarry) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
         """
         Performs one active SMC update.
 
@@ -350,7 +355,7 @@ def smc_da_step_jax(
 
         if adaptive:
             key_c, fit_key = jax.random.split(key_c)
-            fit = refresh_nfm(
+            fit = refresh(
                 op.fit, cur_rw["u"], cur_rw["weights"], fit_key,
                 iteration=state_c.t + 1, beta=cur_rw["beta"],
                 n_active=n_active,
@@ -360,7 +365,7 @@ def smc_da_step_jax(
         def finish_stage(key_c):
             transform = stage_flow.bijection.transform_and_log_det
             if adaptive:
-                theta_keep = transform_nfm_history(
+                theta_keep = transform_flow_history(
                     stage_flow, cur_rw["u"], sampling_mode_l, state_c.t, state_c.u.shape[1]
                 )
             else:
@@ -407,8 +412,8 @@ def smc_da_step_jax(
                 geom_mu=geom_new.t_mean,
                 geom_cov=geom_new.t_cov,
                 geom_nu=geom_new.t_nu,
-                n_max=stage_flow.config.mutation_cap if adaptive else n_mutation_max_steps,
-                n_steps=stage_flow.config.mutation_steps if adaptive else n_mutation_steps,
+                n_max=adaptive_cap if adaptive else n_mutation_max_steps,
+                n_steps=adaptive_steps if adaptive else n_mutation_steps,
                 condition=None,
             )
 
@@ -460,14 +465,14 @@ def smc_da_step_jax(
                 calls=mutated["calls"],
             )
 
-            return (NFMSMCDACarry(carry_next, fit) if adaptive else carry_next), stats
+            return (AdaptiveSMCDACarry(carry_next, fit) if adaptive else carry_next), stats
 
         if adaptive:
-            failed = NFMSMCDACarry(current._replace(key=key_c), fit)
+            failed = AdaptiveSMCDACarry(current._replace(key=key_c), fit)
             return lax.cond(fit.fit_ok, finish_stage, lambda _: skip_step(failed), key_c)
         return finish_stage(key_c)
 
-    def skip_step(op: SMCDACarry | NFMSMCDACarry) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
+    def skip_step(op: SMCDACarry | AdaptiveSMCDACarry) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
         """
         Returns the carry unchanged when the sampler is inactive.
 
@@ -524,7 +529,7 @@ def smc_da_step_jax(
     ),
 )
 def run_smc_da_scan_jax(
-    carry0: SMCDACarry | NFMSMCDACarry,
+    carry0: SMCDACarry | AdaptiveSMCDACarry,
     *,
     n_scan_steps: int,
     n_total: Array,
@@ -551,7 +556,7 @@ def run_smc_da_scan_jax(
     ] = mutate,
     loglike_single_fn: Callable[[Array], tuple[Array, Array]],
     logprior_fn: Callable[[Array], Array],
-) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
+) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
     """
     Runs several SMC-DA steps with JAX scan.
 
@@ -603,7 +608,7 @@ def run_smc_da_scan_jax(
         ESS trimming value used inside reweighting.
         This is static for JAX compilation.
     flow:
-        Fixed flow for SMCDACarry. Adaptive calls use the flow in NFMSMCDACarry.fit.
+        Fixed flow for SMCDACarry. Adaptive calls use the flow in AdaptiveSMCDACarry.fit.
     scaler_cfg:
         scaler configuration passed to the mutation function.
     scaler_masks:
@@ -623,9 +628,9 @@ def run_smc_da_scan_jax(
     """
 
     def scan_body(
-        carry: SMCDACarry | NFMSMCDACarry,
+        carry: SMCDACarry | AdaptiveSMCDACarry,
         _: Array,
-    ) -> tuple[SMCDACarry | NFMSMCDACarry, SMCDAStepStats]:
+    ) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
         """
         Runs one scan iteration.
 

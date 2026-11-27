@@ -736,6 +736,7 @@ class SamplerJAX:
         loglike_approx_single_fn: Callable[[Array], Any] | None = None,
         local_gnh_fn: Callable[[Array], Array] | None = None,
         adaptive_nfm: bool = False,
+        adaptive_flow: bool = False,
     ):
         """
         Initializes the sampler wrapper.
@@ -758,9 +759,10 @@ class SamplerJAX:
         flow:
             optional flow object.
             If None, IdentityFlowJAX is used.
+        adaptive_flow:
+            Fit the supplied CDFlow or NFMFlow to the retained weighted particles.
         adaptive_nfm:
-            Set True together with an initialized NFMFlow
-            to fit that map on the retained weighted particles during this run.
+            Legacy switch for an adaptive NFMFlow.
         loglike_approx_single_fn:
             optional approximate likelihood function.
             Required when cfg.delayed_acceptance is True.
@@ -797,6 +799,7 @@ class SamplerJAX:
             cfg=cfg,
             flow=self.flow,
             adaptive_nfm=adaptive_nfm,
+            adaptive_flow=adaptive_flow,
             local_gnh_fn=local_gnh_fn,
         )
 
@@ -984,7 +987,27 @@ def _build_step_from_particles(
     )
 
 
-def transform_nfm_history(flow, particles, sampling_mode, history_steps, history_width):
+def adaptive_flow_policy(flow, dimension):
+    """Resolve the trainer and mutation budget from static model metadata."""
+    from ..normalizing_flow.cdf import CDFlow, refresh_cdf
+
+    if isinstance(flow, CDFlow):
+        refresh = refresh_cdf
+        steps = max(1, dimension // 2)
+        cap = 10 * steps
+    else:
+        from ..normalizing_flow.nfm import NFMFlow, refresh_nfm
+
+        if not isinstance(flow, NFMFlow):
+            raise TypeError("adaptive_flow requires an initialized CDFlow or NFMFlow")
+        refresh = refresh_nfm
+        steps, cap = flow.config.mutation_steps, flow.config.mutation_cap
+    if flow.config.n_dim != dimension:
+        raise ValueError("adaptive flow dimension must match the particle dimension")
+    return refresh, steps, cap
+
+
+def transform_flow_history(flow, particles, sampling_mode, history_steps, history_width):
     """Encode retained u rows for geometry without evaluating unused history slots."""
     def encode(rows):
         return flow.transform_and_log_det(rows, None)[0]
@@ -1006,6 +1029,10 @@ def transform_nfm_history(flow, particles, sampling_mode, history_steps, history
     return lax.fori_loop(0, history_steps, encode_step, output)
 
 
+# Preserve the original helper import for existing callers.
+transform_nfm_history = transform_flow_history
+
+
 def make_run_fn(
     *,
     prior: Prior,
@@ -1015,6 +1042,7 @@ def make_run_fn(
     flow: Any | None = None,
     local_gnh_fn: Callable[[Array], Array] | None = None,
     adaptive_nfm: bool = False,
+    adaptive_flow: bool = False,
 ) -> _RunFunction:
     """
     Builds the sampler run function.
@@ -1058,14 +1086,16 @@ def make_run_fn(
 
     # static kernel/config values captured by the jitted run function
     kernel = str(cfg.kernel).lower()
-    # Supply an initialized NFMFlow and enable adaptive fitting
-    # to enable same-run training. Other flows remain fixed as before.
-    train_nfm = adaptive_nfm
-    if train_nfm:
-        from ..normalizing_flow.nfm import NFMFitState, NFMFlow, refresh_nfm
+    train_flow = adaptive_flow or adaptive_nfm
+    if train_flow:
+        from ..normalizing_flow.training import FlowFitState
 
-        if not isinstance(flow_obj, NFMFlow) or flow_obj.config.n_dim != cfg.n_dim:
-            raise ValueError("adaptive fitting requires an NFMFlow with cfg.n_dim coordinates")
+        if adaptive_nfm:
+            from ..normalizing_flow.nfm import NFMFlow
+
+            if not isinstance(flow_obj, NFMFlow):
+                raise ValueError("adaptive_nfm requires an NFMFlow")
+        refresh, adaptive_steps, adaptive_cap = adaptive_flow_policy(flow_obj, cfg.n_dim)
 
     use_pcn_bool = bool(cfg.preconditioned)
 
@@ -1280,7 +1310,7 @@ def make_run_fn(
         Returns:
         --------
         RunOutputJAX:
-            Final particle history and evidence, plus the optional NFM fit status.
+            Final particle history and evidence, plus the optional flow fit status.
         """
         # convert key and choose dtype
         key = jnp.asarray(key)
@@ -1549,7 +1579,7 @@ def make_run_fn(
             )
             within_cap = it < jnp.asarray(n_max_steps, dtype=it.dtype)
             active = not_done & within_cap
-            return active & fit.fit_ok if train_nfm else active
+            return active & fit.fit_ok if train_flow else active
 
         def body_fn(carry):
             """
@@ -1588,19 +1618,19 @@ def make_run_fn(
                 trim_ess=trim_ess,
             )
 
-            if train_nfm:
+            if train_flow:
                 key_c, fit_key = jax.random.split(key_c)
-                fit = refresh_nfm(
+                fit = refresh(
                     fit, cur_rw["u"], cur_rw["weights"], fit_key,
                     iteration=state_c.t + 1, beta=cur_rw["beta"],
                     n_active=n_active,
                 )
-            stage_flow = fit.flow if train_nfm else flow_obj
+            stage_flow = fit.flow if train_flow else flow_obj
 
             def finish_stage(key_c):
                 transform = stage_flow.bijection.transform_and_log_det
-                if train_nfm:
-                    theta_keep = transform_nfm_history(
+                if train_flow:
+                    theta_keep = transform_flow_history(
                         stage_flow, cur_rw["u"], sampling_mode, state_c.t, state_c.u.shape[1]
                     )
                 else:
@@ -1707,8 +1737,8 @@ def make_run_fn(
                     dili_cov_ref=dili_cov_ref,
                     dili_lis_scale=dili_lis_scale,
                     dili_cs_scale=dili_cs_scale,
-                    n_max=stage_flow.config.mutation_cap if train_nfm else n_max_steps,
-                    n_steps=stage_flow.config.mutation_steps if train_nfm else n_steps,
+                    n_max=adaptive_cap if train_flow else n_max_steps,
+                    n_steps=adaptive_steps if train_flow else n_steps,
                     use_delayed_acceptance=jnp.asarray(cfg.delayed_acceptance),
                     da_c_const=jnp.asarray(cfg.da_c_const, dtype=dtype),
                     da_d_const=jnp.asarray(cfg.da_d_const, dtype=dtype),
@@ -1744,7 +1774,7 @@ def make_run_fn(
 
                 return (key_c, next_state, cur_next, geom_new, n_eff_new, it + jnp.int32(1), fit)
 
-            if train_nfm:
+            if train_flow:
                 return lax.cond(
                     fit.fit_ok, finish_stage,
                     lambda key: (key, state_c, cur_c, geom_c, n_eff_c2, it, fit),
@@ -1753,7 +1783,7 @@ def make_run_fn(
             return finish_stage(key_c)
 
         # run outer SMC loop
-        initial_fit = NFMFitState.initial(flow_obj, cfg.n_effective) if train_nfm else None
+        initial_fit = FlowFitState.initial(flow_obj, cfg.n_effective) if train_flow else None
         key, state, _cur, geom, n_eff_c, _itf, final_fit = lax.while_loop(
             cond_fn,
             body_fn,
@@ -1769,7 +1799,7 @@ def make_run_fn(
         logz_err = jnp.asarray(jnp.nan, dtype=dtype)
 
         output = RunOutputJAX(state=state, logz=logz_final, logz_err=logz_err)
-        return output, final_fit.fit_ok if train_nfm else None
+        return output, final_fit.fit_ok if train_flow else None
 
     def run(key: Array, n_total: int | None = None) -> RunOutputJAX:
         """
@@ -1810,8 +1840,8 @@ def make_run_fn(
             blob_dim=cfg.blob_dim,
         )
 
-        if train_nfm and not bool(fit_ok):
-            raise FloatingPointError("NFM refresh failed before mutation")
+        if train_flow and not bool(fit_ok):
+            raise FloatingPointError("Adaptive flow refresh failed before mutation")
         return output
 
     return run
