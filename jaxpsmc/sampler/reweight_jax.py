@@ -395,10 +395,11 @@ def reweight_step_jax(
 
     # keep highest trimmed weights
     order = jnp.argsort(w_trim)
-    start = jnp.int32(n_tot - keep_max)
-    idx = lax.dynamic_slice_in_dim(
-        order, start_index=start, slice_size=keep_max, axis=0
-    )[::-1]
+    if keep_max < 1:
+        raise ValueError("keep_max must be positive")
+    # Both bounds are static at trace time; retain the original tie ordering.
+    keep_count = min(keep_max, n_tot)
+    idx = order[n_tot - keep_count:][::-1]
 
     # extract kept weights and mask out zeros
     w_keep = w_trim[idx]
