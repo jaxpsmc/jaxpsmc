@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from jax import lax
 
 # helper modules used by the sampler
+from ..normalizing_flow.diagnostics import FlowFitError, empty_fit, empty_stage, failed_stage, stage_stats
 from ..geometry.dili_geometry_jax import build_dili_pcn_geometry_jax
 from ..geometry.geometry_jax import Geometry, geometry_fit_jax
 from ..particles_jax import (
@@ -640,6 +641,7 @@ class RunOutputJAX:
     state: ParticlesState
     logz: Array
     logz_err: Array
+    flow_diagnostics: Any = None
 
     def tree_flatten(self):
         """
@@ -659,7 +661,7 @@ class RunOutputJAX:
             children tuple and no auxiliary data.
         """
         # ParticlesState is already a pytree, so return it directly
-        return (self.state, self.logz, self.logz_err), None
+        return (self.state, self.logz, self.logz_err, self.flow_diagnostics), None
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
@@ -682,8 +684,7 @@ class RunOutputJAX:
             rebuilt sampler output object.
         """
         # read stored fields and rebuild object
-        state, logz, logz_err = children
-        return cls(state=state, logz=logz, logz_err=logz_err)
+        return cls(*children)
 
 
 class _RunFunction(Protocol):
@@ -737,6 +738,7 @@ class SamplerJAX:
         local_gnh_fn: Callable[[Array], Array] | None = None,
         adaptive_nfm: bool = False,
         adaptive_flow: bool = False,
+        diagnostic_observables: Callable | None = None,
     ):
         """
         Initializes the sampler wrapper.
@@ -800,6 +802,7 @@ class SamplerJAX:
             flow=self.flow,
             adaptive_nfm=adaptive_nfm,
             adaptive_flow=adaptive_flow,
+            diagnostic_observables=diagnostic_observables,
             local_gnh_fn=local_gnh_fn,
         )
 
@@ -1043,6 +1046,7 @@ def make_run_fn(
     local_gnh_fn: Callable[[Array], Array] | None = None,
     adaptive_nfm: bool = False,
     adaptive_flow: bool = False,
+    diagnostic_observables: Callable | None = None,
 ) -> _RunFunction:
     """
     Builds the sampler run function.
@@ -1567,7 +1571,7 @@ def make_run_fn(
                 True means another outer SMC step should run.
             """
             # unpack values needed by the stop rule
-            _key_c, state_c, cur_c, _geom_c, _n_eff_c2, it, fit = carry
+            _key_c, state_c, cur_c, _geom_c, _n_eff_c2, it, fit, trace = carry
 
             # continue while sampler has not met stop rule
             not_done = not_termination_jax(
@@ -1602,7 +1606,7 @@ def make_run_fn(
                 updated loop carry for the next SMC iteration.
             """
             # unpack current loop state
-            key_c, state_c, cur_c, geom_c, n_eff_c2, it, fit = carry
+            key_c, state_c, cur_c, geom_c, n_eff_c2, it, fit, trace = carry
 
             # reweight persistent history according to the selected sampling mode
             cur_rw, n_eff_new, stats = reweight_fn(
@@ -1620,6 +1624,8 @@ def make_run_fn(
 
             if train_flow:
                 key_c, fit_key = jax.random.split(key_c)
+                if diagnostic_observables is not None:
+                    fit = fit._replace(diagnostics=empty_fit(dtype))
                 fit = refresh(
                     fit, cur_rw["u"], cur_rw["weights"], fit_key,
                     iteration=state_c.t + 1, beta=cur_rw["beta"],
@@ -1716,6 +1722,7 @@ def make_run_fn(
                     loglike_approx_single_fn=loglike_approx_wrapped,
                     logprior_fn=prior.logpdf1,
                     flow=stage_flow,
+                    collect_diagnostics=diagnostic_observables is not None,
                     scaler_cfg=scaler_cfg,
                     scaler_masks=scaler_masks,
                     # Existing pCN keeps the Student-t geometry.
@@ -1772,22 +1779,41 @@ def make_run_fn(
                     "proposal_scale": mutated["proposal_scale"],
                 }
 
-                return (key_c, next_state, cur_next, geom_new, n_eff_new, it + jnp.int32(1), fit)
+                next_trace = trace
+                if diagnostic_observables is not None:
+                    record = stage_stats(diagnostic_observables, state_c, cur_c["beta"], cur_rw,
+                        rs_out, mutated, _info["flow_diagnostics"],
+                        fit.diagnostics if train_flow else empty_fit(dtype))
+                    next_trace = jax.tree.map(lambda a, v: a.at[it].set(v), trace, record)
+                return (key_c, next_state, cur_next, geom_new, n_eff_new, it + jnp.int32(1), fit, next_trace)
 
             if train_flow:
+                def stop_stage(key):
+                    failed_trace = trace
+                    if diagnostic_observables is not None:
+                        record = failed_stage(diagnostic_observables, cur_c["x"], cur_rw["beta"], fit.diagnostics)
+                        failed_trace = jax.tree.map(lambda a, v: a.at[it].set(v), trace, record)
+                    return key, state_c, cur_c, geom_c, n_eff_c2, it, fit, failed_trace
+
                 return lax.cond(
                     fit.fit_ok, finish_stage,
-                    lambda key: (key, state_c, cur_c, geom_c, n_eff_c2, it, fit),
+                    stop_stage,
                     key_c,
                 )
             return finish_stage(key_c)
 
         # run outer SMC loop
         initial_fit = FlowFitState.initial(flow_obj, cfg.n_effective) if train_flow else None
-        key, state, _cur, geom, n_eff_c, _itf, final_fit = lax.while_loop(
+        trace = None
+        if diagnostic_observables is not None:
+            row = empty_stage(diagnostic_observables, last_x)
+            trace = jax.tree.map(lambda a: jnp.broadcast_to(a, (n_max_steps,) + a.shape), row)
+            if train_flow:
+                initial_fit = initial_fit._replace(diagnostics=empty_fit(dtype))
+        key, state, _cur, geom, n_eff_c, _itf, final_fit, trace = lax.while_loop(
             cond_fn,
             body_fn,
-            (key, state, current_particles0, geom, n_eff_c, iter0, initial_fit),
+            (key, state, current_particles0, geom, n_eff_c, iter0, initial_fit, trace),
         )
 
         # compute final log-evidence from stored history
@@ -1798,7 +1824,7 @@ def make_run_fn(
         )
         logz_err = jnp.asarray(jnp.nan, dtype=dtype)
 
-        output = RunOutputJAX(state=state, logz=logz_final, logz_err=logz_err)
+        output = RunOutputJAX(state=state, logz=logz_final, logz_err=logz_err, flow_diagnostics=trace)
         return output, final_fit.fit_ok if train_flow else None
 
     def run(key: Array, n_total: int | None = None) -> RunOutputJAX:
@@ -1841,7 +1867,7 @@ def make_run_fn(
         )
 
         if train_flow and not bool(fit_ok):
-            raise FloatingPointError("Adaptive flow refresh failed before mutation")
+            raise FlowFitError(output.flow_diagnostics)
         return output
 
     return run

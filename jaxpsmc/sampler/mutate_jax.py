@@ -6,6 +6,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from ..normalizing_flow.diagnostics import MUT_FIELDS
 from ..mcmc.dili_pcn_jax import dili_pcn_jax
 from ..mcmc.li_pcn_jax import likelihood_informed_pcn_jax
 from ..mcmc.pcn_jax import preconditioned_pcn_jax
@@ -90,6 +91,7 @@ def mutate(
     da_c_const: Array = jnp.asarray(0.01),
     da_d_const: Array = jnp.asarray(2.0),
     condition: Array | None = None,
+    collect_diagnostics: bool = False,
 ) -> tuple[Array, dict[str, Array], dict[str, Array]]:
     """
     Runs the mutation step to the selected pCN-type kernel.
@@ -292,6 +294,7 @@ def mutate(
             da_c_const=da_c_const,
             da_d_const=da_d_const,
             condition=condition,
+            collect_diagnostics=collect_diagnostics,
         )
 
     def _do_li_pcn(op):
@@ -358,6 +361,7 @@ def mutate(
             da_c_const=da_c_const,
             da_d_const=da_d_const,
             condition=condition,
+            collect_diagnostics=collect_diagnostics,
         )
 
     def _do_dili_pcn(op):
@@ -437,6 +441,7 @@ def mutate(
             da_c_const=da_c_const,
             da_d_const=da_d_const,
             condition=condition,
+            collect_diagnostics=collect_diagnostics,
         )
 
     def _do_noop(op):
@@ -487,6 +492,7 @@ def mutate(
             "accept": z0f,
             "steps": z0i,
             "calls": z0i,
+            **({"flow_diagnostics": jnp.zeros(len(MUT_FIELDS), z0f.dtype)} if collect_diagnostics else {}),
             "proposal_scale": proposal_scale0,
         }
 
@@ -541,6 +547,7 @@ def mutate(
         "accept": results["accept"],
         "steps": results["steps"],
         "calls_increment": results["calls"],
+        **({"flow_diagnostics": results["flow_diagnostics"]} if collect_diagnostics else {}),
     }
 
     return results["key"], new_particles, info

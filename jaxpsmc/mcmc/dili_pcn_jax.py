@@ -13,6 +13,7 @@ from ..scaler_jax import (
     apply_boundary_conditions_x_jax,
     inverse_jax,
 )
+from ..normalizing_flow.diagnostics import MUT_FIELDS, mutation_stats
 from .flow_jax import _flow_theta_to_u_jax, _flow_u_to_theta_jax
 
 Array = jax.Array
@@ -286,6 +287,7 @@ def dili_pcn_jax(
     da_c_const: Array = jnp.asarray(0.01),
     da_d_const: Array = jnp.asarray(2.0),
     condition: Array | None = None,
+    collect_diagnostics: bool = False,
 ) -> dict[str, Array]:
     """
     Runs a Hessian/GNH-based DILI-pCN mutation kernel.
@@ -616,6 +618,10 @@ def dili_pcn_jax(
     )
 
     # carry object for lax.while_loop
+    audit = None
+    if collect_diagnostics:
+        audit = jnp.zeros(len(MUT_FIELDS), u.dtype).at[3].set(
+            use_delayed_acceptance * finite_current.sum())
     carry0 = (
         key,
         u,
@@ -635,6 +641,7 @@ def dili_pcn_jax(
         calls0,
         accept0,
         done0,
+        audit,
     )
 
     # adaptive proposal scale: 2.38 / sqrt(D)
@@ -661,7 +668,7 @@ def dili_pcn_jax(
             Boolean scalar. True means another mutation step should run.
         """
         # continue while iterating
-        (_, _, _, _, _, _, _, _, _, _, _, _, _, _, i, _, _, done) = carry
+        (_, _, _, _, _, _, _, _, _, _, _, _, _, _, i, _, _, done, _) = carry
         return (i < jnp.asarray(n_max, dtype=i.dtype)) & (~done)
 
     def body_fn(carry):
@@ -701,6 +708,7 @@ def dili_pcn_jax(
             calls,
             accept,
             done,
+            audit,
         ) = carry
 
         # iteration counter
@@ -861,7 +869,7 @@ def dili_pcn_jax(
             accept_mask = u_rand < alpha
             # store mean acceptance probability as the adaptation signal
             accept_value = jnp.mean(alpha)
-            return accept_mask, accept_value
+            return accept_mask, accept_value, jnp.zeros_like(accept_mask), log_ratio_full
 
         def _da_accept(_):
             """
@@ -893,10 +901,10 @@ def dili_pcn_jax(
                 c_const=da_c_const,
                 d_const=da_d_const,
             )
-            return da.accept, jnp.mean(da.prob_accept)
+            return da.accept, jnp.mean(da.prob_accept), da.pre_accept, da.log_ratio_stage1 + da.log_ratio_stage2
 
         # choose standard MH or delayed acceptance
-        accept_mask, accept_value = jax.lax.cond(
+        accept_mask, accept_value, stage_one, stage_ratio = jax.lax.cond(
             jnp.asarray(use_delayed_acceptance),
             _da_accept,
             _mh_accept,
@@ -904,6 +912,15 @@ def dili_pcn_jax(
         )
 
         # keep proposed theta/u/x only for accepted particles
+        if collect_diagnostics:
+            def reference(z):
+                return -.5 * jnp.sum((z-mu)**2, axis=1)
+
+            audit = mutation_stats(audit, accept_mask, finite1, stage_one, use_delayed_acceptance,
+                stage_ratio, u, u_prime, theta, theta_prime, beta*logl + logp + logdetj,
+                beta*logl_prime + logp_prime + logdetj_prime, reference, log_ratio_full,
+                flow, condition)
+
         theta = jnp.where(accept_mask[:, None], theta_prime, theta)
         u = jnp.where(accept_mask[:, None], u_prime, u)
         x = jnp.where(accept_mask[:, None], x_prime, x)
@@ -970,6 +987,7 @@ def dili_pcn_jax(
             calls,
             accept,
             done,
+            audit,
         )
 
     # run mutation loop using JAX control flow
@@ -995,6 +1013,7 @@ def dili_pcn_jax(
         calls,
         accept,
         _done,
+        audit,
     ) = carry_f
 
     # return updated sampler state and diagnostics
@@ -1011,5 +1030,6 @@ def dili_pcn_jax(
         "accept": accept,
         "steps": i,
         "calls": calls,
+        **({"flow_diagnostics": audit} if collect_diagnostics else {}),
         "proposal_scale": sigma,
     }

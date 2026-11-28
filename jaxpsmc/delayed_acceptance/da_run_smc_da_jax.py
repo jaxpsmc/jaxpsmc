@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ..normalizing_flow.diagnostics import empty_fit, empty_stage, failed_stage, stage_stats
 from ..geometry.geometry_jax import Geometry, geometry_fit_jax
 from ..particles_jax import ParticlesState, ParticlesStep, record_step_jax
 from ..sampler.mutate_jax import mutate
@@ -111,6 +112,7 @@ class SMCDAStepStats(NamedTuple):
     accept: Array
     steps: Array
     calls: Array
+    flow_diagnostics: Any = None
 
 
 def _step_mutated_particles_jax(
@@ -182,6 +184,7 @@ def _step_mutated_particles_jax(
         "trim_ess",
         "sampling_mode",
         "mutation_fn",
+        "diagnostic_observables",
         "loglike_single_fn",
         "logprior_fn",
     ),
@@ -206,6 +209,7 @@ def smc_da_step_jax(
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
     flow: Any = None,
+    diagnostic_observables: Callable | None = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
     mutation_fn: Callable[
@@ -355,8 +359,11 @@ def smc_da_step_jax(
 
         if adaptive:
             key_c, fit_key = jax.random.split(key_c)
+            incoming_fit = op.fit
+            if diagnostic_observables is not None:
+                incoming_fit = incoming_fit._replace(diagnostics=empty_fit(dtype))
             fit = refresh(
-                op.fit, cur_rw["u"], cur_rw["weights"], fit_key,
+                incoming_fit, cur_rw["u"], cur_rw["weights"], fit_key,
                 iteration=state_c.t + 1, beta=cur_rw["beta"],
                 n_active=n_active,
             )
@@ -415,6 +422,7 @@ def smc_da_step_jax(
                 n_max=adaptive_cap if adaptive else n_mutation_max_steps,
                 n_steps=adaptive_steps if adaptive else n_mutation_steps,
                 condition=None,
+                **({"collect_diagnostics": True} if diagnostic_observables is not None else {}),
             )
 
             step = _step_mutated_particles_jax(
@@ -455,7 +463,13 @@ def smc_da_step_jax(
                 iteration=it_c + jnp.asarray(1, dtype=it_c.dtype),
             )
 
+            record = None
+            if diagnostic_observables is not None:
+                record = stage_stats(diagnostic_observables, state_c, cur_c["beta"], cur_rw,
+                    rs_out, mutated, _info["flow_diagnostics"],
+                    fit.diagnostics if adaptive else empty_fit(dtype))
             stats = SMCDAStepStats(
+                flow_diagnostics=record,
                 active=jnp.asarray(True),
                 beta=cur_rw["beta"],
                 logz=cur_rw["logz"],
@@ -465,11 +479,17 @@ def smc_da_step_jax(
                 calls=mutated["calls"],
             )
 
-            return (AdaptiveSMCDACarry(carry_next, fit) if adaptive else carry_next), stats
+            return (AdaptiveSMCDACarry(carry_next, fit._replace(diagnostics=op.fit.diagnostics)) if adaptive else carry_next), stats
 
         if adaptive:
-            failed = AdaptiveSMCDACarry(current._replace(key=key_c), fit)
-            return lax.cond(fit.fit_ok, finish_stage, lambda _: skip_step(failed), key_c)
+            failed = AdaptiveSMCDACarry(current._replace(key=key_c), fit._replace(diagnostics=op.fit.diagnostics))
+            def stop_stage(_):
+                carry_out, stats = skip_step(failed)
+                if diagnostic_observables is not None:
+                    record = failed_stage(diagnostic_observables, cur_c["x"], cur_rw["beta"], fit.diagnostics)
+                    stats = stats._replace(flow_diagnostics=record)
+                return carry_out, stats
+            return lax.cond(fit.fit_ok, finish_stage, stop_stage, key_c)
         return finish_stage(key_c)
 
     def skip_step(op: SMCDACarry | AdaptiveSMCDACarry) -> tuple[SMCDACarry | AdaptiveSMCDACarry, SMCDAStepStats]:
@@ -495,6 +515,8 @@ def smc_da_step_jax(
 
         stats = SMCDAStepStats(
             active=jnp.asarray(False),
+            flow_diagnostics=(empty_stage(diagnostic_observables, cur_c["x"])
+                              if diagnostic_observables is not None else None),
             beta=cur_c["beta"],
             logz=zero_f,
             ess=zero_f,
@@ -524,6 +546,7 @@ def smc_da_step_jax(
         "sampling_mode",
         "trim_ess",
         "mutation_fn",
+        "diagnostic_observables",
         "loglike_single_fn",
         "logprior_fn",
     ),
@@ -549,6 +572,7 @@ def run_smc_da_scan_jax(
     trim_ess: float,
     sampling_mode: str = "truncated_persistent",
     flow: Any = None,
+    diagnostic_observables: Callable | None = None,
     scaler_cfg: Mapping[str, Array],
     scaler_masks: Mapping[str, Array],
     mutation_fn: Callable[
@@ -671,6 +695,7 @@ def run_smc_da_scan_jax(
             scaler_cfg=scaler_cfg,
             scaler_masks=scaler_masks,
             mutation_fn=mutation_fn,
+            diagnostic_observables=diagnostic_observables,
             loglike_single_fn=loglike_single_fn,
             logprior_fn=logprior_fn,
         )

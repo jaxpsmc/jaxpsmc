@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from .diagnostics import fit_stats
+
 
 class FlowFitState(NamedTuple):
     """A failed fit preserves the previous map and sets fit_ok to false."""
@@ -17,13 +19,15 @@ class FlowFitState(NamedTuple):
     initial_n_effective: jax.Array
     last_fit_epochs: jax.Array
 
+    diagnostics: Any = None
+
     @classmethod
     def initial(cls, flow: Any, initial_n_effective):
         return cls(flow, jnp.asarray(False), jnp.asarray(True),
                    jnp.asarray(initial_n_effective, jnp.int32), jnp.int32(0))
 
 
-def _run_epochs(flow, moments, epoch_fn, patience, dtype, limit=5000):
+def _select_epochs(flow, moments, epoch_fn, patience, dtype, limit=5000):
     """Keep best validation checkpoint; at the epoch limit use the final iterate."""
     def active(carry):
         epoch, _, _, _, _, stale, finite = carry
@@ -41,7 +45,11 @@ def _run_epochs(flow, moments, epoch_fn, patience, dtype, limit=5000):
              jnp.int32(0), jnp.asarray(True))
     epochs, final, _, best, _, stale, finite = jax.lax.while_loop(active, step, start)
     selected = jax.lax.cond(stale >= patience, lambda: best, lambda: final)
-    return selected, epochs, finite
+    return selected, epochs, finite, epochs - stale
+
+
+def _run_epochs(flow, moments, epoch_fn, patience, dtype, limit=5000):
+    return _select_epochs(flow, moments, epoch_fn, patience, dtype, limit)[:3]
 
 
 def _logical_batch_size(initial_n_effective, count):
@@ -114,7 +122,10 @@ def _fit_partition(state, particles, weights, key, count, batch_loss, prepare, p
         return flow, moments, loss
 
     flow = prepare(state, particles, weights, rows, n_train)
-    selected, epochs, ok = _run_epochs(flow, optimizer.init(flow), epoch, patience, dtype)
+    selected, epochs, ok, best_epoch = _select_epochs(flow, optimizer.init(flow), epoch, patience, dtype)
+    if state.diagnostics is not None:
+        state = state._replace(diagnostics=fit_stats(
+            state, selected, particles, weights, rows, count, best_epoch, epochs))
     finite = jax.tree.map(lambda p: jnp.all(jnp.isfinite(p)), selected)
     ok &= jnp.all(jnp.stack(jax.tree.leaves(finite)))
     return jax.lax.cond(

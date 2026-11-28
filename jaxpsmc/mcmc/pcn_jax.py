@@ -13,6 +13,7 @@ from ..scaler_jax import (
     apply_boundary_conditions_x_jax,
     inverse_jax,
 )
+from ..normalizing_flow.diagnostics import MUT_FIELDS, mutation_stats
 from .flow_jax import _flow_theta_to_u_jax, _flow_u_to_theta_jax
 
 Array = jax.Array
@@ -49,6 +50,7 @@ def preconditioned_pcn_jax(
     da_c_const: Array = jnp.asarray(0.01),
     da_d_const: Array = jnp.asarray(2.0),
     condition: Array | None = None,
+    collect_diagnostics: bool = False,
 ) -> dict[str, Array]:
     """
     Runs a preconditioned pCN mutation kernel for a batch of particles.
@@ -431,6 +433,10 @@ def preconditioned_pcn_jax(
     )
 
     # pack loop state into one tuple for lax.while_loop.
+    audit = None
+    if collect_diagnostics:
+        audit = jnp.zeros(len(MUT_FIELDS), u.dtype).at[3].set(
+            use_delayed_acceptance * finite_current.sum())
     carry0 = (
         key,
         u,
@@ -450,6 +456,7 @@ def preconditioned_pcn_jax(
         calls0,
         accept0,
         done0,
+        audit,
     )
 
     # cap adaptive proposal scale
@@ -478,7 +485,7 @@ def preconditioned_pcn_jax(
             True means another pCN update should run.
         """
         # stop when iteration limit is reached or done becomes True
-        (_, _, _, _, _, _, _, _, _, _, _, _, _, _, i, _, _, done) = carry
+        (_, _, _, _, _, _, _, _, _, _, _, _, _, _, i, _, _, done, _) = carry
         return (i < jnp.asarray(n_max, dtype=i.dtype)) & (~done)
 
     def body_fn(carry):
@@ -524,6 +531,7 @@ def preconditioned_pcn_jax(
             calls,
             accept,
             done,
+            audit,
         ) = carry
 
         # move to the next inner iteration
@@ -590,6 +598,7 @@ def preconditioned_pcn_jax(
             x_prime, finite0
         )
         finite1 = finite0 & jnp.isfinite(logp_prime)
+        calls = calls + jnp.sum(finite1, dtype=jnp.int32)
 
         # evaluate full likelihood only for proposals that passed the prior step
         logl_prime, blobs_prime = jax.vmap(
@@ -700,7 +709,7 @@ def preconditioned_pcn_jax(
             accept_mask_mh = u_rand < alpha
             accept_value_mh = jnp.mean(alpha)
 
-            return accept_mask_mh, accept_value_mh
+            return accept_mask_mh, accept_value_mh, jnp.zeros_like(accept_mask_mh), log_ratio_full
 
         def _da_accept(_):
             """
@@ -732,9 +741,9 @@ def preconditioned_pcn_jax(
                 d_const=da_d_const,
             )
 
-            return da.accept, jnp.mean(da.prob_accept)
+            return da.accept, jnp.mean(da.prob_accept), da.pre_accept, da.log_ratio_stage1 + da.log_ratio_stage2
 
-        accept_mask, accept_value = jax.lax.cond(
+        accept_mask, accept_value, stage_one, stage_ratio = jax.lax.cond(
             jnp.asarray(use_delayed_acceptance),
             _da_accept,
             _mh_accept,
@@ -742,6 +751,16 @@ def preconditioned_pcn_jax(
         )
 
         # apply accept/reject updates to all particle values
+        if collect_diagnostics:
+            def reference(z):
+                white = jax.scipy.linalg.solve_triangular(chol_cov, (z-mu).T, lower=True)
+                return -.5 * (geom_nu + n_dim) * jnp.log1p(jnp.sum(white**2, axis=0)/geom_nu)
+
+            audit = mutation_stats(audit, accept_mask, finite1, stage_one, use_delayed_acceptance,
+                stage_ratio, u, u_prime, theta, theta_prime, beta*logl + logp + logdetj,
+                beta*logl_prime + logp_prime + logdetj_prime, reference, log_ratio_full,
+                flow, condition)
+
         theta = jnp.where(accept_mask[:, None], theta_prime, theta)
         u = jnp.where(accept_mask[:, None], u_prime, u)
         x = jnp.where(accept_mask[:, None], x_prime, x)
@@ -810,6 +829,7 @@ def preconditioned_pcn_jax(
             calls,
             accept,
             done,
+            audit,
         )
 
     # run iterative PCN update loop
@@ -835,6 +855,7 @@ def preconditioned_pcn_jax(
         calls,
         accept,
         _done,
+        audit,
     ) = carry_f
 
     # return updated state and summary values
@@ -851,5 +872,6 @@ def preconditioned_pcn_jax(
         "accept": accept,
         "steps": i,
         "calls": calls,
+        **({"flow_diagnostics": audit} if collect_diagnostics else {}),
         "proposal_scale": sigma,
     }
