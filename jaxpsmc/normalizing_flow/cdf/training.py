@@ -13,7 +13,7 @@ def _batch_loss(flow, particles, weights, key):
     z, logdet = flow.transform_and_log_det(particles)
     losses = 0.5 * jnp.sum(jnp.square(z), axis=-1) - logdet
     scaled = weights / jnp.max(weights)
-    return jnp.sum((scaled / jnp.sum(scaled)) * losses)
+    return 1000.0 * jnp.sum((scaled / jnp.sum(scaled)) * losses)
 
 
 def _prepare(state, particles, weights, rows, n_train):
